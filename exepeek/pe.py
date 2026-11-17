@@ -14,6 +14,69 @@ SUBSYSTEMS = {1:'Native', 2:'Windows GUI', 3:'Консоль Windows', 7:'POSIX'
               12:'EFI Runtime Driver', 14:'Xbox', 16:'Windows Boot Application'}
 
 
+def has_certificate_table(handle):
+    """Check certificate-table framing without reading certificate payloads.
+
+    Return False only for an absent directory. Malformed/unsupported PE headers
+    and malformed tables raise PEError, separately from ordinary PE metadata.
+    """
+    size = os.fstat(handle.fileno()).st_size
+
+    def read_at(offset, length):
+        if offset < 0 or offset + length > size:
+            raise PEError('Таблица сертификатов или заголовок PE обрезаны.')
+        handle.seek(offset)
+        data = handle.read(length)
+        if len(data) != length:
+            raise PEError('Таблица сертификатов или заголовок PE обрезаны.')
+        return data
+
+    dos = read_at(0, 64)
+    if dos[:2] != b'MZ':
+        raise PEError('Заголовок MZ отсутствует.')
+    offset = struct.unpack_from('<I', dos, 60)[0]
+    if offset < 64:
+        raise PEError('Некорректное смещение PE.')
+    header = read_at(offset, 24)
+    if header[:4] != b'PE\0\0':
+        raise PEError('Заголовок PE отсутствует.')
+    sections = struct.unpack_from('<H', header, 6)[0]
+    optional_size = struct.unpack_from('<H', header, 20)[0]
+    optional = read_at(offset + 24, optional_size)
+    magic = struct.unpack_from('<H', optional)[0] if len(optional) >= 2 else 0
+    base = {0x10b: 96, 0x20b: 112}.get(magic)
+    if base is None or len(optional) < base:
+        raise PEError('Некорректный необязательный заголовок PE.')
+    count = struct.unpack_from('<I', optional, base - 4)[0]
+    if count > (len(optional) - base) // 8:
+        raise PEError('Таблица каталогов PE обрезана.')
+    header_end = offset + 24 + optional_size + 40 * sections
+    if header_end > size:
+        raise PEError('Таблица секций PE обрезана.')
+    if count <= 4:
+        return False
+    start, length = struct.unpack_from('<II', optional, base + 4 * 8)
+    if not start and not length:
+        return False
+    if (not start or not length or start % 8 or start < header_end
+            or start > size or length > size - start):
+        raise PEError('Некорректные границы таблицы сертификатов.')
+    end = start + length
+    entries = 0
+    while start < end:
+        entries += 1
+        if entries > 65536:
+            raise PEError('Слишком много записей в таблице сертификатов.')
+        if end - start < 8:
+            raise PEError('Обрезан заголовок WIN_CERTIFICATE.')
+        entry_length = struct.unpack_from('<I', read_at(start, 8))[0]
+        aligned_length = (entry_length + 7) & ~7
+        if entry_length < 8 or aligned_length > end - start:
+            raise PEError('Некорректная длина WIN_CERTIFICATE.')
+        start += aligned_length
+    return True
+
+
 def read_pe(handle):
     size = os.fstat(handle.fileno()).st_size
     handle.seek(0)
@@ -58,7 +121,8 @@ def read_pe(handle):
     if count > 14:
         rva, length = struct.unpack_from('<II', optional, base+14*8)
         if rva or length:
-            if not rva or length < 72 or rva+length > 2**32:
+            image_size = struct.unpack_from('<I', optional, 56)[0]
+            if not rva or length < 72 or rva+length > image_size:
                 raise PEError('Некорректный каталог CLR (.NET).')
             clr_offset=None
             header_size=struct.unpack_from('<I',optional,60)[0]

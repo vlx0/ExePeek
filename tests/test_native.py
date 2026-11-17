@@ -18,7 +18,7 @@ from exepeek import native
 
 class ClassificationTests(unittest.TestCase):
     def test_conservative_statuses_and_signed_hresult(self):
-        cases = [(0, "valid"), (0x800B0100, "unsigned"),
+        cases = [(0, "valid"), (0x800B0100, "unknown"),
                  (0x80096010, "invalid"), (0x800B0109, "untrusted"),
                  (0x80092013, "unknown"), (0x800B010E, "unknown"),
                  (5, "unknown"), (0xDEADBEEF, "unknown")]
@@ -95,7 +95,7 @@ class WindowsTests(unittest.TestCase):
 
             with patch.object(native, "_dll"), patch.object(native, "_bind", return_value=verify), \
                     patch.object(native, "_signer", side_effect=OSError("identity unavailable")):
-                result = native.verify_signature(__file__)
+                result = native.verify_signature(sys.executable)
             self.assertEqual(calls, [1, 2])
             self.assertEqual(result.code, result_code & 0xFFFFFFFF)
             self.assertEqual(result.signer, "")
@@ -124,6 +124,69 @@ class WindowsTests(unittest.TestCase):
             self.assertEqual(result.status, "invalid", result)
             self.assertEqual(result.code, 0x80096010)
             self.assertEqual(changed.read_bytes(), data)
+
+    def test_signed_copy_with_corrupt_certificate_framing(self):
+        path = Path(os.environ.get("EXEPEEK_SIGNED_EXE", sys.executable))
+        original = path.read_bytes()
+        signature = native.verify_signature(path)
+        if signature.status == "unsigned" and "EXEPEEK_SIGNED_EXE" not in os.environ:
+            self.skipTest("Python has no embedded signature; set EXEPEEK_SIGNED_EXE")
+        self.assertIn(signature.status, {"valid", "untrusted"}, signature)
+        optional = struct.unpack_from('<I', original, 60)[0] + 24
+        base = 112 if struct.unpack_from('<H', original, optional)[0] == 0x20b else 96
+        directory = optional + base + 4*8
+        certificate, length = struct.unpack_from('<II', original, directory)
+        self.assertGreater(length, 8)
+        with tempfile.TemporaryDirectory() as folder:
+            changed = Path(folder) / 'corrupt-certificate.exe'
+            for offset, value in ((certificate, 0xffffffff), (certificate, 0),
+                                  (directory, 0xffffffff), (directory+4, 0xffffffff)):
+                data = bytearray(original)
+                struct.pack_into('<I', data, offset, value)
+                changed.write_bytes(data)
+                with self.subTest(offset=offset, value=value):
+                    result = native.verify_signature(changed)
+                    self.assertEqual(result.status, 'unknown', result)
+                    self.assertEqual(result.code, 0x800B0100)
+                    self.assertIn('WIN_CERTIFICATE' if offset == certificate else
+                                  'границы', result.note)
+                    from exepeek.core import inspect_file
+                    report = inspect_file(str(changed))
+                    self.assertEqual(report['signature']['status'], 'unknown')
+                    self.assertTrue(report['version'].get('file_version'))
+                    self.assertEqual(changed.read_bytes(), data)
+            # Well-framed but unrecognized entries also cannot prove absence.
+            data = bytearray(original)
+            struct.pack_into('<IHH', data, certificate, length, 0x200, 0xffff)
+            changed.write_bytes(data)
+            result = native.verify_signature(changed)
+            self.assertEqual(result.status, 'unknown', result)
+            self.assertNotEqual(result.code, 0)
+        self.assertEqual(path.read_bytes(), original)
+
+    def test_nosignature_requires_absent_table_and_always_closes_state(self):
+        # A provider can return NOSIGNATURE for malformed or unrecognized data.
+        from exepeek.pe import PEError
+        cases = [(False, 'unsigned'), (True, 'unknown'),
+                 (PEError('bad certificate framing'), 'unknown')]
+        for table, expected in cases:
+            calls = []
+
+            def verify(hwnd, action, pointer):
+                trust = ctypes.cast(pointer, ctypes.POINTER(native._TrustData)).contents
+                calls.append(trust.dwStateAction)
+                self.assertEqual(trust.dwProvFlags, 0x1010)
+                trust.hWVTStateData = 123
+                return ctypes.c_int32(0x800B0100).value
+
+            kwargs = {'side_effect': table} if isinstance(table, Exception) else {'return_value': table}
+            with self.subTest(table=table), patch.object(native, '_dll'), \
+                    patch.object(native, '_bind', return_value=verify), \
+                    patch.object(native, 'has_certificate_table', **kwargs):
+                result = native.verify_signature(sys.executable)
+            self.assertEqual(result.status, expected)
+            self.assertEqual(result.code, 0x800B0100)
+            self.assertEqual(calls, [1, 2])
 
 
 if __name__ == "__main__":

@@ -11,6 +11,8 @@ from dataclasses import dataclass
 import os
 import uuid
 
+from .pe import PEError, has_certificate_table
+
 
 @dataclass(frozen=True)
 class Signature:
@@ -120,7 +122,7 @@ def _classify(code):
     if code == 0:
         return "valid", "Подпись действительна"
     if code == 0x800B0100:  # TRUST_E_NOSIGNATURE
-        return "unsigned", "Встроенная подпись отсутствует"
+        return "unknown", "Не удалось распознать встроенную подпись"
     if code in {0x80096010, 0x80090006, 0x80096004}:  # digest/signature failures
         return "invalid", "Подпись повреждена или недействительна"
     if code in {0x800B0004, 0x800B0101, 0x800B0109, 0x800B010A,
@@ -166,8 +168,13 @@ def verify_signature(path) -> Signature:
     try:
         path = os.path.abspath(os.fsdecode(path))
         # Distinguish inaccessible/missing input from a genuine absent signature.
-        with open(path, "rb"):
-            pass
+        table_error = ""
+        table_present = None
+        with open(path, "rb") as handle:
+            try:
+                table_present = has_certificate_table(handle)
+            except (PEError, OSError) as exc:
+                table_error = str(exc)
         dll = _dll("wintrust.dll")
         verify = _bind(dll, "WinVerifyTrust", W.LONG, W.HWND,
                        C.c_void_p, C.POINTER(_TrustData))
@@ -184,13 +191,19 @@ def verify_signature(path) -> Signature:
         try:
             code = verify(W.HWND(-1), action, C.byref(trust)) & 0xFFFFFFFF
             status, label = _classify(code)
+            note = _NOTE
+            if table_error:
+                status, label = "unknown", "Некорректная таблица сертификатов или заголовок PE"
+                note += " Ошибка: " + table_error
+            elif code == 0x800B0100 and table_present is False:
+                status, label = "unsigned", "Встроенная подпись отсутствует"
             signer = ""
             if trust.hWVTStateData and status in {"valid", "untrusted"}:
                 try:
                     signer = _signer(dll, trust.hWVTStateData)
                 except (OSError, AttributeError, ValueError):
                     pass  # Identity is optional; verification remains authoritative.
-            return Signature(status, label, signer, code, _NOTE)
+            return Signature(status, label, signer, code, note)
         finally:
             # Close even failed verification states; all provider pointers expire.
             trust.dwStateAction = 2  # WTD_STATEACTION_CLOSE
